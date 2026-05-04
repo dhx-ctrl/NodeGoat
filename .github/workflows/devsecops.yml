@@ -8,7 +8,7 @@ name: DevSecOps - Security Scans (CI)
 #   • Requires a MongoDB sidecar — the ZAP step starts mongo on the same
 #     Docker network before launching the app container.
 #   • No official pre-built Docker Hub image — the image is built from the
-#     repository Dockerfile during CI and tagged locally.
+#     repository Dockerfile during CI and tagged locally
 #   • Default port: 4000
 #
 # Scanner enable-flags default to true. Set any to false to skip that scanner.
