@@ -5,8 +5,7 @@ name: DevSecOps - Security Scans (CI)
 #
 # NodeGoat specifics
 # ──────────────────
-#   • Requires a MongoDB sidecar — the ZAP step starts mongo on the same
-#     Docker network before launching the app container.
+#   • Requires a MongoDB sidecar.
 #   • No official pre-built Docker Hub image — the image is built from the
 #     repository Dockerfile during CI and tagged locally.
 #   • Default port: 4000
@@ -68,7 +67,6 @@ jobs:
         uses: actions/checkout@v4
 
       # ── Prepare output directory ───────────────────────────────────────────
-      # chmod 777 ensures ZAP's non-root user (UID 1000) can write into it.
       - name: Prepare scan output directory
         shell: bash
         run: |
@@ -101,8 +99,6 @@ jobs:
           cat "$RUN_OUTPUT_DIR/scan_meta.env"
 
       # ── Build NodeGoat Docker image ────────────────────────────────────────
-      # NodeGoat has no pre-built image on Docker Hub, so we build from the
-      # repo Dockerfile.  The local tag is reused by Trivy image scan and ZAP.
       - name: Build NodeGoat Docker image
         if: env.ENABLE_TRIVY_IMAGE == 'true' || env.ENABLE_ZAP == 'true'
         shell: bash
@@ -155,7 +151,6 @@ jobs:
           echo "trivy_fs.json written ($(wc -c < "$RUN_OUTPUT_DIR/trivy_fs.json") bytes)"
 
       # ── SCA: Trivy image ───────────────────────────────────────────────────
-      # Scans the locally built image (no Docker Hub pull needed).
       - name: "Trivy image scan -> trivy_image.json"
         if: env.ENABLE_TRIVY_IMAGE == 'true'
         shell: bash
@@ -181,69 +176,86 @@ jobs:
         shell: bash
         run: docker network create zapnet || true
 
-      # NodeGoat requires MongoDB — start it on zapnet before the app.
+      # ── Start MongoDB for NodeGoat ─────────────────────────────────────────
       - name: "Start MongoDB for NodeGoat"
         if: env.ENABLE_ZAP == 'true'
         shell: bash
         run: |
           set -euo pipefail
+
           docker pull mongo:4.4
           docker rm -f "mongo-${APP_NAME}" 2>/dev/null || true
+
           docker run -d \
             --name "mongo-${APP_NAME}" \
             --network zapnet \
+            --network-alias "mongo-${APP_NAME}" \
+            --network-alias mongo \
             mongo:4.4
+
           echo "Waiting for MongoDB to accept connections..."
           for i in {1..30}; do
-            # mongo:4.4 ships with the classic 'mongo' shell, not 'mongosh'
-            # (mongosh became the default in MongoDB 5.0+)
             if docker exec "mongo-${APP_NAME}" mongo --eval "db.runCommand({ping:1})" --quiet >/dev/null 2>&1; then
               echo "MongoDB ready after ${i}×2s"
-              break
+              exit 0
             fi
             sleep 2
           done
 
+          echo "ERROR: MongoDB did not become ready"
+          docker logs "mongo-${APP_NAME}" --tail 100 || true
+          exit 1
+
+      # ── Start NodeGoat for ZAP ─────────────────────────────────────────────
       - name: "Start target app for ZAP: nodegoat"
         if: env.ENABLE_ZAP == 'true'
         shell: bash
         run: |
           set -euo pipefail
-          docker rm -f "target-${APP_NAME}" 2>/dev/null || true
 
-          # NodeGoat reads MONGODB_URI from environment.  Point it at the
-          # mongo sidecar we started on the zapnet network.
+          docker rm -f "target-${APP_NAME}" 2>/dev/null || true
+          docker pull curlimages/curl:8.6.0
+
+          # NodeGoat's Dockerfile does not start the app correctly by itself.
+          # The official compose flow waits for MongoDB, seeds the DB, then runs npm start.
           docker run -d \
             --name "target-${APP_NAME}" \
             --network zapnet \
+            --network-alias "target-${APP_NAME}" \
+            -e "PORT=${APP_PORT}" \
             -e "MONGODB_URI=mongodb://mongo-${APP_NAME}:27017/nodegoat" \
             -p "${APP_PORT}:${APP_PORT}" \
-            "$DOCKER_IMAGE_NAME"
+            "$DOCKER_IMAGE_NAME" \
+            sh -c "until nc -z -w 2 mongo-${APP_NAME} 27017 && echo 'mongo is ready' && node artifacts/db-reset.js && npm start; do echo 'waiting for mongo / db seed...'; sleep 2; done"
 
           echo "Waiting for $APP_NAME to become ready..."
-          for i in {1..60}; do
-            # Use localhost here — 'target-nodegoat' is only resolvable inside
-            # the zapnet Docker network, NOT from the host runner.
-            # The -p flag maps APP_PORT to the host so localhost works fine.
-            if curl -sSf "http://localhost:${APP_PORT}" >/dev/null 2>&1; then
-              echo "$APP_NAME ready after ${i}×2s"
-              break
+
+          for i in {1..90}; do
+            RUNNING="$(docker inspect -f '{{.State.Running}}' "target-${APP_NAME}" 2>/dev/null || echo false)"
+
+            if [ "$RUNNING" != "true" ]; then
+              echo "ERROR: target-${APP_NAME} container stopped early. Logs:"
+              docker logs "target-${APP_NAME}" --tail 200 || true
+              exit 1
             fi
+
+            HTTP_CODE="$(docker run --rm --network zapnet curlimages/curl:8.6.0 \
+              -sS -o /dev/null -w "%{http_code}" --max-time 5 "$APP_URL" 2>/dev/null || echo 000)"
+
+            if [[ "$HTTP_CODE" =~ ^(200|301|302)$ ]]; then
+              echo "$APP_NAME ready after ${i}×2s with HTTP $HTTP_CODE"
+              exit 0
+            fi
+
+            echo "Attempt ${i}/90: not ready yet, HTTP=$HTTP_CODE"
             sleep 2
           done
 
-          # Abort early if NodeGoat exited (e.g. couldn't connect to MongoDB).
-          # A stopped container disappears from Docker DNS, which causes ZAP to
-          # fail with "Name or service not known" rather than a useful scan error.
-          if [ "$(docker inspect -f '{{.State.Running}}' "target-${APP_NAME}" 2>/dev/null)" != "true" ]; then
-            echo "ERROR: target-${APP_NAME} container is not running. Logs:"
-            docker logs "target-${APP_NAME}" --tail 50 || true
-            exit 1
-          fi
+          echo "ERROR: $APP_NAME did not become ready in time. Logs:"
+          docker logs "target-${APP_NAME}" --tail 200 || true
+          exit 1
 
-      # FIX: Mount $RUN_OUTPUT_DIR (not the workspace) as /zap/wrk so that
-      # ZAP's non-root user (UID 1000) can write zap.yaml, zap.xml, zap.html.
-      # Output files land directly in $RUN_OUTPUT_DIR — no cp needed.
+      # ── ZAP baseline scan ─────────────────────────────────────────────────
       - name: "ZAP baseline scan -> zap.xml"
         if: env.ENABLE_ZAP == 'true'
         shell: bash
@@ -255,7 +267,7 @@ jobs:
             ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
             -t "$APP_URL" \
             -x zap.xml \
-            -r zap.html || true   # ZAP exits non-zero when findings exist
+            -r zap.html || true
 
           test -s "$RUN_OUTPUT_DIR/zap.xml"
           echo "zap.xml written ($(wc -c < "$RUN_OUTPUT_DIR/zap.xml") bytes)"
@@ -336,16 +348,16 @@ jobs:
             echo "══════════════════════════════════════════════════"
             case "$scanner" in
               semgrep)
-                [[ -s "$RUN_OUTPUT_DIR/semgrep.json" ]]     && inspect_semgrep             || echo "  SKIPPED / missing"
+                [[ -s "$RUN_OUTPUT_DIR/semgrep.json" ]] && inspect_semgrep || echo "  SKIPPED / missing"
                 ;;
               trivy_fs)
-                [[ -s "$RUN_OUTPUT_DIR/trivy_fs.json" ]]    && inspect_trivy trivy_fs.json || echo "  SKIPPED / missing"
+                [[ -s "$RUN_OUTPUT_DIR/trivy_fs.json" ]] && inspect_trivy trivy_fs.json || echo "  SKIPPED / missing"
                 ;;
               trivy_image)
                 [[ -s "$RUN_OUTPUT_DIR/trivy_image.json" ]] && inspect_trivy trivy_image.json || echo "  SKIPPED / missing"
                 ;;
               zap)
-                [[ -s "$RUN_OUTPUT_DIR/zap.xml" ]]          && inspect_zap                 || echo "  SKIPPED / missing"
+                [[ -s "$RUN_OUTPUT_DIR/zap.xml" ]] && inspect_zap || echo "  SKIPPED / missing"
                 ;;
             esac
           done
