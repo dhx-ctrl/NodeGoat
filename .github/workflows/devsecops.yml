@@ -195,7 +195,9 @@ jobs:
             mongo:4.4
           echo "Waiting for MongoDB to accept connections..."
           for i in {1..30}; do
-            if docker exec "mongo-${APP_NAME}" mongosh --eval "db.runCommand({ping:1})" >/dev/null 2>&1; then
+            # mongo:4.4 ships with the classic 'mongo' shell, not 'mongosh'
+            # (mongosh became the default in MongoDB 5.0+)
+            if docker exec "mongo-${APP_NAME}" mongo --eval "db.runCommand({ping:1})" --quiet >/dev/null 2>&1; then
               echo "MongoDB ready after ${i}×2s"
               break
             fi
@@ -218,14 +220,26 @@ jobs:
             -p "${APP_PORT}:${APP_PORT}" \
             "$DOCKER_IMAGE_NAME"
 
-          echo "Waiting for $APP_URL to become ready..."
+          echo "Waiting for $APP_NAME to become ready..."
           for i in {1..60}; do
-            if curl -sSf "$APP_URL" >/dev/null 2>&1; then
+            # Use localhost here — 'target-nodegoat' is only resolvable inside
+            # the zapnet Docker network, NOT from the host runner.
+            # The -p flag maps APP_PORT to the host so localhost works fine.
+            if curl -sSf "http://localhost:${APP_PORT}" >/dev/null 2>&1; then
               echo "$APP_NAME ready after ${i}×2s"
               break
             fi
             sleep 2
           done
+
+          # Abort early if NodeGoat exited (e.g. couldn't connect to MongoDB).
+          # A stopped container disappears from Docker DNS, which causes ZAP to
+          # fail with "Name or service not known" rather than a useful scan error.
+          if [ "$(docker inspect -f '{{.State.Running}}' "target-${APP_NAME}" 2>/dev/null)" != "true" ]; then
+            echo "ERROR: target-${APP_NAME} container is not running. Logs:"
+            docker logs "target-${APP_NAME}" --tail 50 || true
+            exit 1
+          fi
 
       # FIX: Mount $RUN_OUTPUT_DIR (not the workspace) as /zap/wrk so that
       # ZAP's non-root user (UID 1000) can write zap.yaml, zap.xml, zap.html.
